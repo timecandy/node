@@ -86,7 +86,8 @@ class SharedEngineIsolate {
 
   Handle<WasmInstanceObject> ImportInstance(SharedModule shared_module) {
     Handle<WasmModuleObject> module_object =
-        isolate()->wasm_engine()->ImportNativeModule(isolate(), shared_module);
+        isolate()->wasm_engine()->ImportNativeModule(isolate(), shared_module,
+                                                     {});
     ErrorThrower thrower(isolate(), "ImportInstance");
     MaybeHandle<WasmInstanceObject> instance =
         isolate()->wasm_engine()->SyncInstantiate(isolate(), &thrower,
@@ -131,8 +132,8 @@ namespace {
 
 ZoneBuffer* BuildReturnConstantModule(Zone* zone, int constant) {
   TestSignatures sigs;
-  ZoneBuffer* buffer = new (zone) ZoneBuffer(zone);
-  WasmModuleBuilder* builder = new (zone) WasmModuleBuilder(zone);
+  ZoneBuffer* buffer = zone->New<ZoneBuffer>(zone);
+  WasmModuleBuilder* builder = zone->New<WasmModuleBuilder>(zone);
   WasmFunctionBuilder* f = builder->AddFunction(sigs.i_v());
   f->builder()->AddExport(CStrVector("main"), f);
   byte code[] = {WASM_I32V_2(constant)};

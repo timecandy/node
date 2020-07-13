@@ -6,6 +6,7 @@
 #define V8_AST_SCOPES_H_
 
 #include <numeric>
+
 #include "src/ast/ast.h"
 #include "src/base/compiler-specific.h"
 #include "src/base/hashmap.h"
@@ -15,6 +16,7 @@
 #include "src/objects/objects.h"
 #include "src/utils/pointer-with-payload.h"
 #include "src/utils/utils.h"
+#include "src/zone/zone-hashmap.h"
 #include "src/zone/zone.h"
 
 namespace v8 {
@@ -102,6 +104,10 @@ class V8_EXPORT_PRIVATE Scope : public NON_EXPORTED_BASE(ZoneObject) {
     }
     inline explicit Snapshot(Scope* scope);
 
+    // Disallow copy and move.
+    Snapshot(const Snapshot&) = delete;
+    Snapshot(Snapshot&&) = delete;
+
     ~Snapshot() {
       // If we're still active, there was no arrow function. In that case outer
       // calls eval if it already called eval before this snapshot started, or
@@ -142,10 +148,6 @@ class V8_EXPORT_PRIVATE Scope : public NON_EXPORTED_BASE(ZoneObject) {
     Scope* top_inner_scope_;
     UnresolvedList::Iterator top_unresolved_;
     base::ThreadedList<Variable>::Iterator top_local_;
-
-    // Disallow copy and move.
-    Snapshot(const Snapshot&) = delete;
-    Snapshot(Snapshot&&) = delete;
   };
 
   enum class DeserializationMode { kIncludingVariables, kScopesOnly };
@@ -697,6 +699,7 @@ class V8_EXPORT_PRIVATE Scope : public NON_EXPORTED_BASE(ZoneObject) {
   friend class DeclarationScope;
   friend class ClassScope;
   friend class ScopeTestHelper;
+  friend Zone;
 
   Zone* zone_;
 
@@ -909,7 +912,8 @@ class V8_EXPORT_PRIVATE DeclarationScope : public Scope {
   // Check if the scope has conflicting var
   // declarations, i.e. a var declaration that has been hoisted from a nested
   // scope over a let binding of the same name.
-  Declaration* CheckConflictingVarDeclarations();
+  Declaration* CheckConflictingVarDeclarations(
+      bool* allowed_catch_binding_var_redeclaration);
 
   void set_has_checked_syntax(bool has_checked_syntax) {
     has_checked_syntax_ = has_checked_syntax;
@@ -1257,7 +1261,7 @@ class V8_EXPORT_PRIVATE DeclarationScope : public Scope {
 
   V8_INLINE RareData* EnsureRareData() {
     if (rare_data_ == nullptr) {
-      rare_data_ = new (zone_) RareData;
+      rare_data_ = zone_->New<RareData>();
     }
     return rare_data_;
   }
@@ -1438,8 +1442,8 @@ class V8_EXPORT_PRIVATE ClassScope : public Scope {
   }
   V8_INLINE RareData* EnsureRareData() {
     if (GetRareData() == nullptr) {
-      rare_data_and_is_parsing_heritage_.SetPointer(new (zone_)
-                                                        RareData(zone_));
+      rare_data_and_is_parsing_heritage_.SetPointer(
+          zone_->New<RareData>(zone_));
     }
     return GetRareData();
   }

@@ -242,7 +242,7 @@ void Hints::EnsureAllocated(Zone* zone, bool check_zone_equality) {
     // ... else {zone} lives no longer than {impl_->zone_} but we have no way of
     // checking that.
   } else {
-    impl_ = new (zone) HintsImpl(zone);
+    impl_ = zone->New<HintsImpl>(zone);
   }
   DCHECK(IsAllocated());
 }
@@ -1037,7 +1037,7 @@ SerializerForBackgroundCompilation::SerializerForBackgroundCompilation(
       function_(closure, broker->isolate(), zone()),
       osr_offset_(osr_offset),
       jump_target_environments_(zone()),
-      environment_(new (zone()) Environment(
+      environment_(zone()->New<Environment>(
           zone(), CompilationSubject(closure, broker_->isolate(), zone()))),
       arguments_(zone()) {
   closure_hints_.AddConstant(closure, zone(), broker_);
@@ -1060,9 +1060,9 @@ SerializerForBackgroundCompilation::SerializerForBackgroundCompilation(
       function_(function.virtual_closure()),
       osr_offset_(BailoutId::None()),
       jump_target_environments_(zone()),
-      environment_(new (zone())
-                       Environment(zone(), broker_->isolate(), function,
-                                   new_target, arguments, padding)),
+      environment_(zone()->New<Environment>(zone(), broker_->isolate(),
+                                            function, new_target, arguments,
+                                            padding)),
       arguments_(arguments),
       nesting_level_(nesting_level) {
   Handle<JSFunction> closure;
@@ -1088,6 +1088,9 @@ bool SerializerForBackgroundCompilation::BailoutOnUninitialized(
   if (!osr_offset().IsNone()) {
     // Exclude OSR from this optimization because we might end up skipping the
     // OSR entry point. TODO(neis): Support OSR?
+    return false;
+  }
+  if (FLAG_turboprop && feedback.slot_kind() == FeedbackSlotKind::kCall) {
     return false;
   }
   if (feedback.IsInsufficient()) {
@@ -2299,6 +2302,12 @@ void SerializerForBackgroundCompilation::ProcessBuiltinCall(
         if (arguments.size() >= 1) {
           ProcessMapHintsForPromises(arguments[0]);
         }
+        SharedFunctionInfoRef(
+            broker(),
+            broker()->isolate()->factory()->promise_catch_finally_shared_fun());
+        SharedFunctionInfoRef(
+            broker(),
+            broker()->isolate()->factory()->promise_then_finally_shared_fun());
       }
       break;
     }
@@ -2433,6 +2442,17 @@ void SerializerForBackgroundCompilation::ProcessBuiltinCall(
               kMissingArgumentsAreUnknown, result_hints);
         }
       }
+      SharedFunctionInfoRef(
+          broker(), broker()
+                        ->isolate()
+                        ->factory()
+                        ->promise_capability_default_reject_shared_fun());
+      SharedFunctionInfoRef(
+          broker(), broker()
+                        ->isolate()
+                        ->factory()
+                        ->promise_capability_default_resolve_shared_fun());
+
       break;
     case Builtins::kFunctionPrototypeCall:
       if (arguments.size() >= 1) {
@@ -2675,7 +2695,7 @@ void SerializerForBackgroundCompilation::ContributeToJumpTargetEnvironment(
   auto it = jump_target_environments_.find(target_offset);
   if (it == jump_target_environments_.end()) {
     jump_target_environments_[target_offset] =
-        new (zone()) Environment(*environment());
+        zone()->New<Environment>(*environment());
   } else {
     it->second->Merge(environment(), zone(), broker());
   }

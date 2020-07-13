@@ -19,6 +19,7 @@
 #include "src/execution/runtime-profiler.h"
 #include "src/execution/vm-state-inl.h"
 #include "src/handles/global-handles.h"
+#include "src/heap/combined-heap.h"
 #include "src/init/bootstrapper.h"
 #include "src/interpreter/bytecodes.h"
 #include "src/interpreter/interpreter.h"
@@ -87,8 +88,6 @@ static const char* ComputeMarker(const wasm::WasmCode* code) {
   switch (code->kind()) {
     case wasm::WasmCode::kFunction:
       return code->is_liftoff() ? "" : "*";
-    case wasm::WasmCode::kInterpreterEntry:
-      return "~";
     default:
       return "";
   }
@@ -1378,31 +1377,44 @@ void Logger::CodeDisableOptEvent(Handle<AbstractCode> code,
   msg.WriteToLogFile();
 }
 
-void Logger::CodeDeoptEvent(Handle<Code> code, DeoptimizeKind kind, Address pc,
-                            int fp_to_sp_delta) {
-  if (!log_->IsEnabled()) return;
-  Deoptimizer::DeoptInfo info = Deoptimizer::GetDeoptInfo(*code, pc);
+void Logger::ProcessDeoptEvent(Handle<Code> code, SourcePosition position,
+                               const char* kind, const char* reason) {
   Log::MessageBuilder msg(log_.get());
   msg << "code-deopt" << kNext << timer_.Elapsed().InMicroseconds() << kNext
       << code->CodeSize() << kNext
       << reinterpret_cast<void*>(code->InstructionStart());
 
-  // Deoptimization position.
   std::ostringstream deopt_location;
   int inlining_id = -1;
   int script_offset = -1;
-  if (info.position.IsKnown()) {
-    info.position.Print(deopt_location, *code);
-    inlining_id = info.position.InliningId();
-    script_offset = info.position.ScriptOffset();
+  if (position.IsKnown()) {
+    position.Print(deopt_location, *code);
+    inlining_id = position.InliningId();
+    script_offset = position.ScriptOffset();
   } else {
     deopt_location << "<unknown>";
   }
   msg << kNext << inlining_id << kNext << script_offset << kNext;
-  msg << Deoptimizer::MessageFor(kind) << kNext;
-  msg << deopt_location.str().c_str() << kNext
-      << DeoptimizeReasonToString(info.deopt_reason);
+  msg << kind << kNext;
+  msg << deopt_location.str().c_str() << kNext << reason;
   msg.WriteToLogFile();
+}
+
+void Logger::CodeDeoptEvent(Handle<Code> code, DeoptimizeKind kind, Address pc,
+                            int fp_to_sp_delta, bool reuse_code) {
+  if (!log_->IsEnabled()) return;
+  Deoptimizer::DeoptInfo info = Deoptimizer::GetDeoptInfo(*code, pc);
+  ProcessDeoptEvent(code, info.position,
+                    Deoptimizer::MessageFor(kind, reuse_code),
+                    DeoptimizeReasonToString(info.deopt_reason));
+}
+
+void Logger::CodeDependencyChangeEvent(Handle<Code> code,
+                                       Handle<SharedFunctionInfo> sfi,
+                                       const char* reason) {
+  if (!log_->IsEnabled()) return;
+  SourcePosition position(sfi->StartPosition(), -1);
+  ProcessDeoptEvent(code, position, "dependency-change", reason);
 }
 
 namespace {
@@ -1838,7 +1850,7 @@ void Logger::LogAccessorCallbacks() {
 void Logger::LogAllMaps() {
   DisallowHeapAllocation no_gc;
   Heap* heap = isolate_->heap();
-  HeapObjectIterator iterator(heap);
+  CombinedHeapObjectIterator iterator(heap);
   for (HeapObject obj = iterator.Next(); !obj.is_null();
        obj = iterator.Next()) {
     if (!obj.IsMap()) continue;
@@ -2067,10 +2079,6 @@ void ExistingCodeLogger::LogCodeObject(Object object) {
       break;
     case AbstractCode::WASM_TO_JS_FUNCTION:
       description = "A Wasm to JavaScript adapter";
-      tag = CodeEventListener::STUB_TAG;
-      break;
-    case AbstractCode::WASM_INTERPRETER_ENTRY:
-      description = "A Wasm to Interpreter adapter";
       tag = CodeEventListener::STUB_TAG;
       break;
     case AbstractCode::C_WASM_ENTRY:

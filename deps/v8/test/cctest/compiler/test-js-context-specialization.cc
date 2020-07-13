@@ -25,7 +25,7 @@ class ContextSpecializationTester : public HandleAndZoneScope {
  public:
   explicit ContextSpecializationTester(Maybe<OuterContext> context)
       : canonical_(main_isolate()),
-        graph_(new (main_zone()) Graph(main_zone())),
+        graph_(main_zone()->New<Graph>(main_zone())),
         common_(main_zone()),
         javascript_(main_zone()),
         machine_(main_zone()),
@@ -33,8 +33,7 @@ class ContextSpecializationTester : public HandleAndZoneScope {
         jsgraph_(main_isolate(), graph(), common(), &javascript_, &simplified_,
                  &machine_),
         reducer_(main_zone(), graph(), &tick_counter_),
-        js_heap_broker_(main_isolate(), main_zone(), FLAG_trace_heap_broker,
-                        false),
+        js_heap_broker_(main_isolate(), main_zone()),
         spec_(&reducer_, jsgraph(), &js_heap_broker_, context,
               MaybeHandle<JSFunction>()) {}
 
@@ -179,6 +178,9 @@ TEST(ReduceJSLoadContext0) {
     CHECK(match.HasValue());
     CHECK_EQ(*expected, *match.Value());
   }
+
+  // Clean up so that verifiers don't complain.
+  native->set(slot, Smi::zero());
 }
 
 TEST(ReduceJSLoadContext1) {
@@ -477,6 +479,9 @@ TEST(ReduceJSStoreContext0) {
     CHECK_EQ(0, static_cast<int>(access.depth()));
     CHECK_EQ(false, access.immutable());
   }
+
+  // Clean up so that verifiers don't complain.
+  native->set(slot, Smi::zero());
 }
 
 TEST(ReduceJSStoreContext1) {

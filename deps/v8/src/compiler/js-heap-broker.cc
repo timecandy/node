@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/compiler/js-heap-broker.h"
+#include "src/common/globals.h"
 #include "src/compiler/heap-refs.h"
 
 #ifdef ENABLE_SLOW_DCHECKS
@@ -279,6 +280,11 @@ CallHandlerInfoData::CallHandlerInfoData(JSHeapBroker* broker,
                                          Handle<CallHandlerInfo> object)
     : HeapObjectData(broker, storage, object),
       callback_(v8::ToCData<Address>(object->callback())) {}
+
+// These definitions are here in order to please the linker, which in debug mode
+// sometimes requires static constants to be defined in .cc files.
+const uint32_t JSHeapBroker::kMinimalRefsBucketCount;
+const uint32_t JSHeapBroker::kInitialRefsBucketCount;
 
 void JSHeapBroker::IncrementTracingIndentation() { ++trace_indentation_; }
 
@@ -609,6 +615,7 @@ class JSFunctionData : public JSObjectData {
   bool has_feedback_vector() const { return has_feedback_vector_; }
   bool has_initial_map() const { return has_initial_map_; }
   bool has_prototype() const { return has_prototype_; }
+  bool IsOptimized() const { return is_optimized_; }
   bool PrototypeRequiresRuntimeLookup() const {
     return PrototypeRequiresRuntimeLookup_;
   }
@@ -622,6 +629,7 @@ class JSFunctionData : public JSObjectData {
   ObjectData* prototype() const { return prototype_; }
   SharedFunctionInfoData* shared() const { return shared_; }
   FeedbackVectorData* feedback_vector() const { return feedback_vector_; }
+  CodeData* code() const { return code_; }
   int initial_map_instance_size_with_min_slack() const {
     CHECK(serialized_);
     return initial_map_instance_size_with_min_slack_;
@@ -631,6 +639,7 @@ class JSFunctionData : public JSObjectData {
   bool has_feedback_vector_;
   bool has_initial_map_;
   bool has_prototype_;
+  bool is_optimized_;
   bool PrototypeRequiresRuntimeLookup_;
 
   bool serialized_ = false;
@@ -641,6 +650,7 @@ class JSFunctionData : public JSObjectData {
   ObjectData* prototype_ = nullptr;
   SharedFunctionInfoData* shared_ = nullptr;
   FeedbackVectorData* feedback_vector_ = nullptr;
+  CodeData* code_ = nullptr;
   int initial_map_instance_size_with_min_slack_;
 };
 
@@ -1260,6 +1270,7 @@ JSFunctionData::JSFunctionData(JSHeapBroker* broker, ObjectData** storage,
       has_initial_map_(object->has_prototype_slot() &&
                        object->has_initial_map()),
       has_prototype_(object->has_prototype_slot() && object->has_prototype()),
+      is_optimized_(object->IsOptimized()),
       PrototypeRequiresRuntimeLookup_(
           object->PrototypeRequiresRuntimeLookup()) {}
 
@@ -1276,6 +1287,7 @@ void JSFunctionData::Serialize(JSHeapBroker* broker) {
   DCHECK_NULL(prototype_);
   DCHECK_NULL(shared_);
   DCHECK_NULL(feedback_vector_);
+  DCHECK_NULL(code_);
 
   context_ = broker->GetOrCreateData(function->context())->AsContext();
   native_context_ =
@@ -1285,6 +1297,7 @@ void JSFunctionData::Serialize(JSHeapBroker* broker) {
                          ? broker->GetOrCreateData(function->feedback_vector())
                                ->AsFeedbackVector()
                          : nullptr;
+  code_ = broker->GetOrCreateData(function->code())->AsCode();
   initial_map_ = has_initial_map()
                      ? broker->GetOrCreateData(function->initial_map())->AsMap()
                      : nullptr;
@@ -2023,7 +2036,13 @@ class TemplateObjectDescriptionData : public HeapObjectData {
 class CodeData : public HeapObjectData {
  public:
   CodeData(JSHeapBroker* broker, ObjectData** storage, Handle<Code> object)
-      : HeapObjectData(broker, storage, object) {}
+      : HeapObjectData(broker, storage, object),
+        inlined_bytecode_size_(object->inlined_bytecode_size()) {}
+
+  unsigned inlined_bytecode_size() const { return inlined_bytecode_size_; }
+
+ private:
+  unsigned const inlined_bytecode_size_;
 };
 
 #define DEFINE_IS_AND_AS(Name)                                          \
@@ -2196,7 +2215,7 @@ void JSObjectData::SerializeRecursiveAsBoilerplate(JSHeapBroker* broker,
   Handle<JSObject> boilerplate = Handle<JSObject>::cast(object());
 
   // We only serialize boilerplates that pass the IsInlinableFastLiteral
-  // check, so we only do a sanity check on the depth here.
+  // check, so we only do a check on the depth here.
   CHECK_GT(depth, 0);
   CHECK(!boilerplate->map().is_deprecated());
 
@@ -2371,15 +2390,17 @@ base::Optional<ObjectRef> ContextRef::get(int index,
 }
 
 JSHeapBroker::JSHeapBroker(Isolate* isolate, Zone* broker_zone,
-                           bool tracing_enabled, bool is_concurrent_inlining)
+                           bool tracing_enabled, bool is_concurrent_inlining,
+                           bool is_native_context_independent)
     : isolate_(isolate),
       zone_(broker_zone),
-      refs_(new (zone())
-                RefsMap(kMinimalRefsBucketCount, AddressMatcher(), zone())),
+      refs_(zone()->New<RefsMap>(kMinimalRefsBucketCount, AddressMatcher(),
+                                 zone())),
       root_index_map_(isolate),
       array_and_object_prototypes_(zone()),
       tracing_enabled_(tracing_enabled),
       is_concurrent_inlining_(is_concurrent_inlining),
+      is_native_context_independent_(is_native_context_independent),
       feedback_(zone()),
       bytecode_analyses_(zone()),
       property_access_infos_(zone()),
@@ -2393,9 +2414,11 @@ JSHeapBroker::JSHeapBroker(Isolate* isolate, Zone* broker_zone,
   TRACE(this, "Constructing heap broker");
 }
 
-std::ostream& JSHeapBroker::Trace() const {
-  return trace_out_ << "[" << this << "] "
-                    << std::string(trace_indentation_ * 2, ' ');
+std::string JSHeapBroker::Trace() const {
+  std::ostringstream oss;
+  oss << "[" << this << "] ";
+  for (unsigned i = 0; i < trace_indentation_ * 2; ++i) oss.put(' ');
+  return oss.str();
 }
 
 void JSHeapBroker::StopSerializing() {
@@ -2601,7 +2624,7 @@ void JSHeapBroker::InitializeAndStartSerializing(
   refs_ = nullptr;
 
   refs_ =
-      new (zone()) RefsMap(kInitialRefsBucketCount, AddressMatcher(), zone());
+      zone()->New<RefsMap>(kInitialRefsBucketCount, AddressMatcher(), zone());
 
   SetTargetNativeContextRef(native_context);
   target_native_context().Serialize();
@@ -2653,15 +2676,15 @@ ObjectData* JSHeapBroker::GetOrCreateData(Handle<Object> object) {
     // TODO(neis): Remove these Allow* once we serialize everything upfront.
     AllowHandleDereference handle_dereference;
     if (object->IsSmi()) {
-      new (zone()) ObjectData(this, data_storage, object, kSmi);
+      zone()->New<ObjectData>(this, data_storage, object, kSmi);
     } else if (IsReadOnlyHeapObject(*object)) {
-      new (zone()) ObjectData(this, data_storage, object,
+      zone()->New<ObjectData>(this, data_storage, object,
                               kUnserializedReadOnlyHeapObject);
 #define CREATE_DATA_IF_MATCH(name)                                             \
     } else if (object->Is##name()) {                                           \
       CHECK(SerializingAllowed());                                             \
       AllowHandleAllocation handle_allocation;                                 \
-      new (zone()) name##Data(this, data_storage, Handle<name>::cast(object));
+      zone()->New<name##Data>(this, data_storage, Handle<name>::cast(object));
     HEAP_BROKER_OBJECT_LIST(CREATE_DATA_IF_MATCH)
 #undef CREATE_DATA_IF_MATCH
     } else {
@@ -2843,28 +2866,6 @@ int JSFunctionRef::InitialMapInstanceSizeWithMinSlack() const {
     return object()->ComputeInstanceSizeWithMinSlack(broker()->isolate());
   }
   return data()->AsJSFunction()->initial_map_instance_size_with_min_slack();
-}
-
-// Not needed for TypedLowering.
-base::Optional<ScriptContextTableRef::LookupResult>
-ScriptContextTableRef::lookup(const NameRef& name) const {
-  AllowHandleAllocationIf allow_handle_allocation(data()->kind(),
-                                                  broker()->mode());
-  AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
-                                                    broker()->mode());
-  if (!name.IsString()) return {};
-  ScriptContextTable::LookupResult lookup_result;
-  auto table = object();
-  if (!ScriptContextTable::Lookup(broker()->isolate(), *table,
-                                  *name.AsString().object(), &lookup_result)) {
-    return {};
-  }
-  Handle<Context> script_context = ScriptContextTable::GetContext(
-      broker()->isolate(), table, lookup_result.context_index);
-  LookupResult result{ContextRef(broker(), script_context),
-                      lookup_result.mode == VariableMode::kConst,
-                      lookup_result.slot_index};
-  return result;
 }
 
 OddballType MapRef::oddball_type() const {
@@ -3370,6 +3371,7 @@ BIMODAL_ACCESSOR_C(JSDataView, size_t, byte_offset)
 BIMODAL_ACCESSOR_C(JSFunction, bool, has_feedback_vector)
 BIMODAL_ACCESSOR_C(JSFunction, bool, has_initial_map)
 BIMODAL_ACCESSOR_C(JSFunction, bool, has_prototype)
+BIMODAL_ACCESSOR_C(JSFunction, bool, IsOptimized)
 BIMODAL_ACCESSOR_C(JSFunction, bool, PrototypeRequiresRuntimeLookup)
 BIMODAL_ACCESSOR(JSFunction, Context, context)
 BIMODAL_ACCESSOR(JSFunction, NativeContext, native_context)
@@ -3377,6 +3379,7 @@ BIMODAL_ACCESSOR(JSFunction, Map, initial_map)
 BIMODAL_ACCESSOR(JSFunction, Object, prototype)
 BIMODAL_ACCESSOR(JSFunction, SharedFunctionInfo, shared)
 BIMODAL_ACCESSOR(JSFunction, FeedbackVector, feedback_vector)
+BIMODAL_ACCESSOR(JSFunction, Code, code)
 
 BIMODAL_ACCESSOR_C(JSGlobalObject, bool, IsDetached)
 
@@ -3411,6 +3414,8 @@ BIMODAL_ACCESSOR_C(Map, InstanceType, instance_type)
 BIMODAL_ACCESSOR(Map, Object, GetConstructor)
 BIMODAL_ACCESSOR(Map, HeapObject, GetBackPointer)
 BIMODAL_ACCESSOR_C(Map, bool, is_abandoned_prototype_map)
+
+BIMODAL_ACCESSOR_C(Code, unsigned, inlined_bytecode_size)
 
 #define DEF_NATIVE_CONTEXT_ACCESSOR(type, name) \
   BIMODAL_ACCESSOR(NativeContext, type, name)
@@ -3932,9 +3937,9 @@ ObjectRef::ObjectRef(JSHeapBroker* broker, Handle<Object> object,
       if (*storage == nullptr) {
         AllowHandleDereferenceIf allow_handle_dereference(
             kUnserializedHeapObject, broker->mode());
-        entry->value = new (broker->zone())
-            ObjectData(broker, storage, object,
-                       object->IsSmi() ? kSmi : kUnserializedHeapObject);
+        entry->value = broker->zone()->New<ObjectData>(
+            broker, storage, object,
+            object->IsSmi() ? kSmi : kUnserializedHeapObject);
       }
       data_ = *storage;
       break;
@@ -4443,7 +4448,7 @@ ElementAccessFeedback::transition_groups() const {
 ElementAccessFeedback const& ElementAccessFeedback::Refine(
     ZoneVector<Handle<Map>> const& inferred_maps, Zone* zone) const {
   ElementAccessFeedback& refined_feedback =
-      *new (zone) ElementAccessFeedback(zone, keyed_mode(), slot_kind());
+      *zone->New<ElementAccessFeedback>(zone, keyed_mode(), slot_kind());
   if (inferred_maps.empty()) return refined_feedback;
 
   ZoneUnorderedSet<Handle<Map>, Handle<Map>::hash, Handle<Map>::equal_to>
@@ -4490,7 +4495,6 @@ GlobalAccessFeedback::GlobalAccessFeedback(PropertyCellRef cell,
 
 GlobalAccessFeedback::GlobalAccessFeedback(FeedbackSlotKind slot_kind)
     : ProcessedFeedback(kGlobalAccess, slot_kind),
-      cell_or_context_(base::nullopt),
       index_and_immutable_(0 /* doesn't matter */) {
   DCHECK(IsGlobalICKind(slot_kind));
 }
@@ -4669,37 +4673,61 @@ bool JSHeapBroker::FeedbackIsInsufficient(FeedbackSource const& source) const {
 }
 
 namespace {
-MapHandles GetRelevantReceiverMaps(Isolate* isolate, MapHandles const& maps) {
-  MapHandles result;
-  for (Handle<Map> map : maps) {
+// Remove unupdatable and abandoned prototype maps in-place.
+void FilterRelevantReceiverMaps(Isolate* isolate, MapHandles* maps) {
+  auto in = maps->begin();
+  auto out = in;
+  auto end = maps->end();
+
+  for (; in != end; ++in) {
+    Handle<Map> map = *in;
     if (Map::TryUpdate(isolate, map).ToHandle(&map) &&
         !map->is_abandoned_prototype_map()) {
       DCHECK(!map->is_deprecated());
-      result.push_back(map);
+      *out = *in;
+      ++out;
     }
   }
-  return result;
+
+  // Remove everything between the last valid map and the end of the vector.
+  maps->erase(out, end);
+}
 }  // namespace
-}  // namespace
+
+bool JSHeapBroker::CanUseFeedback(const FeedbackNexus& nexus) const {
+  // TODO(jgruber,v8:8888): Currently, nci code does not use any
+  // feedback. This restriction will be relaxed in the future.
+  return !is_native_context_independent() && !nexus.IsUninitialized();
+}
+
+const ProcessedFeedback& JSHeapBroker::NewInsufficientFeedback(
+    FeedbackSlotKind kind) const {
+  return *zone()->New<InsufficientFeedback>(kind);
+}
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForPropertyAccess(
     FeedbackSource const& source, AccessMode mode,
     base::Optional<NameRef> static_name) {
   FeedbackNexus nexus(source.vector, source.slot);
   FeedbackSlotKind kind = nexus.kind();
-  if (nexus.IsUninitialized()) return *new (zone()) InsufficientFeedback(kind);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(kind);
 
   MapHandles maps;
   nexus.ExtractMaps(&maps);
-  if (!maps.empty()) {
-    maps = GetRelevantReceiverMaps(isolate(), maps);
-    if (maps.empty()) return *new (zone()) InsufficientFeedback(kind);
+  FilterRelevantReceiverMaps(isolate(), &maps);
+
+  // If no maps were found for a non-megamorphic access, then our maps died and
+  // we should soft-deopt.
+  if (maps.empty() && nexus.ic_state() != MEGAMORPHIC) {
+    return NewInsufficientFeedback(kind);
   }
 
   base::Optional<NameRef> name =
       static_name.has_value() ? static_name : GetNameFeedback(nexus);
   if (name.has_value()) {
-    return *new (zone()) NamedAccessFeedback(
+    // We rely on this invariant in JSGenericLowering.
+    DCHECK_IMPLIES(maps.empty(), nexus.ic_state() == MEGAMORPHIC);
+    return *zone()->New<NamedAccessFeedback>(
         *name, ZoneVector<Handle<Map>>(maps.begin(), maps.end(), zone()), kind);
   } else if (nexus.GetKeyType() == ELEMENT && !maps.empty()) {
     return ProcessFeedbackMapsForElementAccess(
@@ -4707,11 +4735,10 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForPropertyAccess(
   } else {
     // No actionable feedback.
     DCHECK(maps.empty());
-    // TODO(neis): Investigate if we really want to treat cleared the same as
-    // megamorphic (also for global accesses).
+    DCHECK_EQ(nexus.ic_state(), MEGAMORPHIC);
     // TODO(neis): Using ElementAccessFeedback here is kind of an abuse.
-    return *new (zone())
-        ElementAccessFeedback(zone(), KeyedAccessMode::FromNexus(nexus), kind);
+    return *zone()->New<ElementAccessFeedback>(
+        zone(), KeyedAccessMode::FromNexus(nexus), kind);
   }
 }
 
@@ -4722,11 +4749,9 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForGlobalAccess(
          nexus.kind() == FeedbackSlotKind::kLoadGlobalNotInsideTypeof ||
          nexus.kind() == FeedbackSlotKind::kStoreGlobalSloppy ||
          nexus.kind() == FeedbackSlotKind::kStoreGlobalStrict);
-  if (nexus.IsUninitialized()) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
-  }
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
   if (nexus.ic_state() != MONOMORPHIC || nexus.GetFeedback()->IsCleared()) {
-    return *new (zone()) GlobalAccessFeedback(nexus.kind());
+    return *zone()->New<GlobalAccessFeedback>(nexus.kind());
   }
 
   Handle<Object> feedback_value(nexus.GetFeedback()->GetHeapObjectOrSmi(),
@@ -4754,7 +4779,7 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForGlobalAccess(
       context_ref.get(context_slot_index,
                       SerializationPolicy::kSerializeIfNeeded);
     }
-    return *new (zone()) GlobalAccessFeedback(context_ref, context_slot_index,
+    return *zone()->New<GlobalAccessFeedback>(context_ref, context_slot_index,
                                               immutable, nexus.kind());
   }
 
@@ -4763,30 +4788,40 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForGlobalAccess(
   // object and the feedback is the cell holding its value.
   PropertyCellRef cell(this, Handle<PropertyCell>::cast(feedback_value));
   cell.Serialize();
-  return *new (zone()) GlobalAccessFeedback(cell, nexus.kind());
+  return *zone()->New<GlobalAccessFeedback>(cell, nexus.kind());
 }
 
-BinaryOperationHint JSHeapBroker::ReadFeedbackForBinaryOperation(
+ProcessedFeedback const& JSHeapBroker::ReadFeedbackForBinaryOperation(
     FeedbackSource const& source) const {
-  return FeedbackNexus(source.vector, source.slot).GetBinaryOperationFeedback();
+  FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+  BinaryOperationHint hint = nexus.GetBinaryOperationFeedback();
+  DCHECK_NE(hint, BinaryOperationHint::kNone);  // Not uninitialized.
+  return *zone()->New<BinaryOperationFeedback>(hint, nexus.kind());
 }
 
-CompareOperationHint JSHeapBroker::ReadFeedbackForCompareOperation(
+ProcessedFeedback const& JSHeapBroker::ReadFeedbackForCompareOperation(
     FeedbackSource const& source) const {
-  return FeedbackNexus(source.vector, source.slot)
-      .GetCompareOperationFeedback();
+  FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+  CompareOperationHint hint = nexus.GetCompareOperationFeedback();
+  DCHECK_NE(hint, CompareOperationHint::kNone);  // Not uninitialized.
+  return *zone()->New<CompareOperationFeedback>(hint, nexus.kind());
 }
 
-ForInHint JSHeapBroker::ReadFeedbackForForIn(
+ProcessedFeedback const& JSHeapBroker::ReadFeedbackForForIn(
     FeedbackSource const& source) const {
-  return FeedbackNexus(source.vector, source.slot).GetForInFeedback();
+  FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+  ForInHint hint = nexus.GetForInFeedback();
+  DCHECK_NE(hint, ForInHint::kNone);  // Not uninitialized.
+  return *zone()->New<ForInFeedback>(hint, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForInstanceOf(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
-  if (nexus.IsUninitialized())
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
 
   base::Optional<JSObjectRef> optional_constructor;
   {
@@ -4796,15 +4831,17 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForInstanceOf(
       optional_constructor = JSObjectRef(this, constructor);
     }
   }
-  return *new (zone()) InstanceOfFeedback(optional_constructor, nexus.kind());
+  return *zone()->New<InstanceOfFeedback>(optional_constructor, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForArrayOrObjectLiteral(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+
   HeapObject object;
-  if (nexus.IsUninitialized() || !nexus.GetFeedback()->GetHeapObject(&object)) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!nexus.GetFeedback()->GetHeapObject(&object)) {
+    return NewInsufficientFeedback(nexus.kind());
   }
 
   AllocationSiteRef site(this, handle(object, isolate()));
@@ -4812,39 +4849,42 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForArrayOrObjectLiteral(
     site.SerializeBoilerplate();
   }
 
-  return *new (zone()) LiteralFeedback(site, nexus.kind());
+  return *zone()->New<LiteralFeedback>(site, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForRegExpLiteral(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+
   HeapObject object;
-  if (nexus.IsUninitialized() || !nexus.GetFeedback()->GetHeapObject(&object)) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!nexus.GetFeedback()->GetHeapObject(&object)) {
+    return NewInsufficientFeedback(nexus.kind());
   }
 
   JSRegExpRef regexp(this, handle(object, isolate()));
   regexp.SerializeAsRegExpBoilerplate();
-  return *new (zone()) RegExpLiteralFeedback(regexp, nexus.kind());
+  return *zone()->New<RegExpLiteralFeedback>(regexp, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForTemplateObject(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+
   HeapObject object;
-  if (nexus.IsUninitialized() || !nexus.GetFeedback()->GetHeapObject(&object)) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!nexus.GetFeedback()->GetHeapObject(&object)) {
+    return NewInsufficientFeedback(nexus.kind());
   }
 
   JSArrayRef array(this, handle(object, isolate()));
-  return *new (zone()) TemplateObjectFeedback(array, nexus.kind());
+  return *zone()->New<TemplateObjectFeedback>(array, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForCall(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
-  if (nexus.IsUninitialized())
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
 
   base::Optional<HeapObjectRef> target_ref;
   {
@@ -4856,7 +4896,7 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForCall(
   }
   float frequency = nexus.ComputeCallFrequency();
   SpeculationMode mode = nexus.GetSpeculationMode();
-  return *new (zone()) CallFeedback(target_ref, frequency, mode, nexus.kind());
+  return *zone()->New<CallFeedback>(target_ref, frequency, mode, nexus.kind());
 }
 
 BinaryOperationHint JSHeapBroker::GetFeedbackForBinaryOperation(
@@ -4958,49 +4998,25 @@ ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForTemplateObject(
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForBinaryOperation(
     FeedbackSource const& source) {
   if (HasFeedback(source)) return GetFeedback(source);
-  BinaryOperationHint hint = ReadFeedbackForBinaryOperation(source);
-  ProcessedFeedback const* feedback;
-  if (hint == BinaryOperationHint::kNone) {
-    feedback =
-        new (zone()) InsufficientFeedback(source.vector->GetKind(source.slot));
-  } else {
-    feedback = new (zone())
-        BinaryOperationFeedback(hint, source.vector->GetKind(source.slot));
-  }
-  SetFeedback(source, feedback);
-  return *feedback;
+  ProcessedFeedback const& feedback = ReadFeedbackForBinaryOperation(source);
+  SetFeedback(source, &feedback);
+  return feedback;
 }
 
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForCompareOperation(
     FeedbackSource const& source) {
   if (HasFeedback(source)) return GetFeedback(source);
-  CompareOperationHint hint = ReadFeedbackForCompareOperation(source);
-  ProcessedFeedback const* feedback;
-  if (hint == CompareOperationHint::kNone) {
-    feedback =
-        new (zone()) InsufficientFeedback(source.vector->GetKind(source.slot));
-  } else {
-    feedback = new (zone())
-        CompareOperationFeedback(hint, source.vector->GetKind(source.slot));
-  }
-  SetFeedback(source, feedback);
-  return *feedback;
+  ProcessedFeedback const& feedback = ReadFeedbackForCompareOperation(source);
+  SetFeedback(source, &feedback);
+  return feedback;
 }
 
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForForIn(
     FeedbackSource const& source) {
   if (HasFeedback(source)) return GetFeedback(source);
-  ForInHint hint = ReadFeedbackForForIn(source);
-  ProcessedFeedback const* feedback;
-  if (hint == ForInHint::kNone) {
-    feedback =
-        new (zone()) InsufficientFeedback(source.vector->GetKind(source.slot));
-  } else {
-    feedback =
-        new (zone()) ForInFeedback(hint, source.vector->GetKind(source.slot));
-  }
-  SetFeedback(source, feedback);
-  return *feedback;
+  ProcessedFeedback const& feedback = ReadFeedbackForForIn(source);
+  SetFeedback(source, &feedback);
+  return feedback;
 }
 
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForPropertyAccess(
@@ -5081,7 +5097,7 @@ ElementAccessFeedback const& JSHeapBroker::ProcessFeedbackMapsForElementAccess(
   }
 
   ElementAccessFeedback* result =
-      new (zone()) ElementAccessFeedback(zone(), keyed_mode, slot_kind);
+      zone()->New<ElementAccessFeedback>(zone(), keyed_mode, slot_kind);
   for (auto entry : transition_groups) {
     result->AddGroup(std::move(entry.second));
   }
@@ -5238,7 +5254,7 @@ BytecodeAnalysis const& JSHeapBroker::GetBytecodeAnalysis(
   }
 
   CHECK_EQ(policy, SerializationPolicy::kSerializeIfNeeded);
-  BytecodeAnalysis* analysis = new (zone()) BytecodeAnalysis(
+  BytecodeAnalysis* analysis = zone()->New<BytecodeAnalysis>(
       bytecode_array, zone(), osr_bailout_id, analyze_liveness);
   DCHECK_EQ(analysis->osr_bailout_id(), osr_bailout_id);
   bytecode_analyses_[bytecode_array_data] = analysis;

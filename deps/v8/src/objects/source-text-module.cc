@@ -185,8 +185,7 @@ MaybeHandle<Cell> SourceTextModule::ResolveExport(
     if (result.second) {
       // |module| wasn't in the map previously, so allocate a new name set.
       Zone* zone = resolve_set->zone();
-      name_set =
-          new (zone->New(sizeof(UnorderedStringSet))) UnorderedStringSet(zone);
+      name_set = zone->New<UnorderedStringSet>(zone);
     } else if (name_set->count(export_name)) {
       // Cycle detected.
       if (must_resolve) {
@@ -581,6 +580,16 @@ Handle<JSModuleNamespace> SourceTextModule::GetModuleNamespace(
   Handle<Module> requested_module(
       Module::cast(module->requested_modules().get(module_request)), isolate);
   return Module::GetModuleNamespace(isolate, requested_module);
+}
+
+Handle<JSObject> SourceTextModule::GetImportMeta(
+    Isolate* isolate, Handle<SourceTextModule> module) {
+  Handle<HeapObject> import_meta(module->import_meta(), isolate);
+  if (import_meta->IsTheHole(isolate)) {
+    import_meta = isolate->RunHostInitializeImportMetaObjectCallback(module);
+    module->set_import_meta(*import_meta);
+  }
+  return Handle<JSObject>::cast(import_meta);
 }
 
 MaybeHandle<Object> SourceTextModule::EvaluateMaybeAsync(

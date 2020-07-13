@@ -927,6 +927,7 @@ Call::CallType Call::GetCallType() const {
   }
   if (property != nullptr) {
     if (property->IsPrivateReference()) {
+      if (is_optional_chain) return PRIVATE_OPTIONAL_CHAIN_CALL;
       return PRIVATE_CALL;
     }
     bool is_super = property->IsSuperAccess();
@@ -1062,7 +1063,7 @@ Literal* AstNodeFactory::NewNumberLiteral(double number, int pos) {
   if (DoubleToSmiInteger(number, &int_value)) {
     return NewSmiLiteral(int_value, pos);
   }
-  return new (zone_) Literal(number, pos);
+  return zone_->New<Literal>(number, pos);
 }
 
 const char* CallRuntime::debug_name() {

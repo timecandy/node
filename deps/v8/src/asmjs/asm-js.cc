@@ -187,7 +187,8 @@ class AsmJsCompilationJob final : public UnoptimizedCompilationJob {
   explicit AsmJsCompilationJob(ParseInfo* parse_info, FunctionLiteral* literal,
                                AccountingAllocator* allocator)
       : UnoptimizedCompilationJob(parse_info->stack_limit(), parse_info,
-                                  &compilation_info_),
+                                  &compilation_info_,
+                                  CanOffThreadFinalize::kNo),
         allocator_(allocator),
         zone_(allocator, ZONE_NAME),
         compilation_info_(&zone_, parse_info, literal),
@@ -223,7 +224,7 @@ class AsmJsCompilationJob final : public UnoptimizedCompilationJob {
 
 UnoptimizedCompilationJob::Status AsmJsCompilationJob::ExecuteJobImpl() {
   // Step 1: Translate asm.js module to WebAssembly module.
-  Zone* compile_zone = compilation_info()->zone();
+  Zone* compile_zone = &zone_;
   Zone translate_zone(allocator_, ZONE_NAME);
 
   Utf16CharacterStream* stream = parse_info()->character_stream();
@@ -240,9 +241,9 @@ UnoptimizedCompilationJob::Status AsmJsCompilationJob::ExecuteJobImpl() {
     }
     return FAILED;
   }
-  module_ = new (compile_zone) wasm::ZoneBuffer(compile_zone);
+  module_ = compile_zone->New<wasm::ZoneBuffer>(compile_zone);
   parser.module_builder()->WriteTo(module_);
-  asm_offsets_ = new (compile_zone) wasm::ZoneBuffer(compile_zone);
+  asm_offsets_ = compile_zone->New<wasm::ZoneBuffer>(compile_zone);
   parser.module_builder()->WriteAsmJsOffsetTable(asm_offsets_);
   stdlib_uses_ = *parser.stdlib_uses();
 
@@ -331,6 +332,13 @@ MaybeHandle<Object> AsmJs::InstantiateAsmWasm(Isolate* isolate,
   // TODO(asmjs): The position currently points to the module definition
   // but should instead point to the instantiation site (more intuitive).
   int position = shared->StartPosition();
+
+  // Check that the module is not instantiated as a generator or async function.
+  if (IsResumableFunction(shared->scope_info().function_kind())) {
+    ReportInstantiationFailure(script, position,
+                               "Cannot be instantiated as resumable function");
+    return MaybeHandle<Object>();
+  }
 
   // Check that all used stdlib members are valid.
   bool stdlib_use_of_typed_array_present = false;

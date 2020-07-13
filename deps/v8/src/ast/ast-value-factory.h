@@ -31,6 +31,7 @@
 #include <forward_list>
 
 #include "src/base/hashmap.h"
+#include "src/base/logging.h"
 #include "src/common/globals.h"
 #include "src/heap/factory.h"
 #include "src/numbers/conversions.h"
@@ -66,6 +67,8 @@ class AstRawString final : public ZoneObject {
   int byte_length() const { return literal_bytes_.length(); }
   const unsigned char* raw_data() const { return literal_bytes_.begin(); }
 
+  bool IsPrivateName() const { return length() > 0 && FirstCharacter() == '#'; }
+
   // For storing AstRawStrings in a hash map.
   uint32_t hash_field() const { return hash_field_; }
   uint32_t Hash() const { return hash_field_ >> Name::kHashShift; }
@@ -80,6 +83,7 @@ class AstRawString final : public ZoneObject {
   friend class AstRawStringInternalizationKey;
   friend class AstStringConstants;
   friend class AstValueFactory;
+  friend Zone;
 
   // Members accessed only by the AstValueFactory & related classes:
   static bool Compare(void* a, void* b);
@@ -130,8 +134,7 @@ class AstConsString final : public ZoneObject {
     if (!IsEmpty()) {
       // We're putting the new string to the head of the list, meaning
       // the string segments will be in reverse order.
-      Segment* tmp = new (zone->New(sizeof(Segment))) Segment;
-      *tmp = segment_;
+      Segment* tmp = zone->New<Segment>(segment_);
       segment_.next = tmp;
     }
     segment_.string = s;
@@ -160,6 +163,7 @@ class AstConsString final : public ZoneObject {
 
  private:
   friend class AstValueFactory;
+  friend Zone;
 
   AstConsString() : string_(), segment_({nullptr, nullptr}) {}
 
@@ -288,6 +292,7 @@ class AstValueFactory {
         empty_cons_string_(nullptr),
         zone_(zone),
         hash_seed_(hash_seed) {
+    DCHECK_NOT_NULL(zone_);
     DCHECK_EQ(hash_seed, string_constants->hash_seed());
     std::fill(one_character_strings_,
               one_character_strings_ + arraysize(one_character_strings_),
@@ -295,7 +300,10 @@ class AstValueFactory {
     empty_cons_string_ = NewConsString();
   }
 
-  Zone* zone() const { return zone_; }
+  Zone* zone() const {
+    DCHECK_NOT_NULL(zone_);
+    return zone_;
+  }
 
   const AstRawString* GetOneByteString(Vector<const uint8_t> literal) {
     return GetOneByteStringInternal(literal);
@@ -317,6 +325,9 @@ class AstValueFactory {
   V8_EXPORT_PRIVATE AstConsString* NewConsString(const AstRawString* str1,
                                                  const AstRawString* str2);
 
+  // Internalize all the strings in the factory, and prevent any more from being
+  // allocated. Multiple calls to Internalize are allowed, for simplicity, where
+  // subsequent calls are a no-op.
   template <typename LocalIsolate>
   void Internalize(LocalIsolate* isolate);
 

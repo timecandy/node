@@ -18,6 +18,7 @@
 #include "src/objects/property-descriptor.h"
 #include "src/objects/prototype.h"
 #include "src/utils/identity-map.h"
+#include "src/zone/zone-hashmap.h"
 
 namespace v8 {
 namespace internal {
@@ -949,7 +950,7 @@ Maybe<bool> KeyAccumulator::CollectOwnKeys(Handle<JSReceiver> receiver,
     if (mode_ == KeyCollectionMode::kIncludePrototypes) {
       return Just(false);
     }
-    // ...whereas [[OwnPropertyKeys]] shall return whitelisted properties.
+    // ...whereas [[OwnPropertyKeys]] shall return allowlisted properties.
     DCHECK_EQ(KeyCollectionMode::kOwnOnly, mode_);
     Handle<AccessCheckInfo> access_check_info;
     {
